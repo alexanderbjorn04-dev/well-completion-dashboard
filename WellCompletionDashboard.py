@@ -104,16 +104,12 @@ _load_dotenv_manual()
 # =============================================================================
 # 1. FILE PATH SETTINGS
 # =============================================================================
-# IMPORTANT:
-# Change this path if your CSV file is somewhere else.
-#
-# Option A: If this dashboard file is in the same folder as the filtered CSV,
-# this default path should work:
-CSV_FILE = Path("AgricultureWellCompletionReport.csv")
+# The CSV is downloaded automatically from the California open data portal the
+# first time the dashboard runs, then cached locally as wellcompletionreports.csv.
+# No manual download or file path changes needed — works locally and on Streamlit Cloud.
 
-# Option B: If you want to use the original full CSV, replace the line above with
-# your full Windows path. Keep the r before the quotes:
-# CSV_FILE = Path(r"C:\Users\abjorn\OneDrive - Cal Poly\well_project\wellcompletionreports (1).csv")
+CSV_URL  = "https://data.cnra.ca.gov/dataset/647afc02-8954-426d-aabd-eff418d2652c/resource/8da7b93b-4e69-495d-9caa-335691a1896b/download/wellcompletionreports.csv"
+CSV_FILE = Path("wellcompletionreports.csv")   # cached local copy
 
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
 
@@ -226,24 +222,77 @@ st.markdown(
 
 
 # =============================================================================
-# 3. HELPER FUNCTIONS
+# 3. AUTO-DOWNLOAD CSV IF NEEDED
+# =============================================================================
+def download_csv_if_needed(url: str, dest: Path) -> None:
+    """
+    Download the CSV from the California open data portal if not already cached.
+    Shows a Streamlit progress bar during download.
+    The file is large (~500 MB) so first run may take several minutes.
+    """
+    if dest.exists():
+        return  # Already cached locally — skip download.
+
+    st.info(
+        "**Downloading Well Completion Reports CSV from the California open data portal.** "
+        "This file is large and may take a few minutes on first run. "
+        f"It will be saved as `{dest.name}` so future launches are instant."
+    )
+
+    try:
+        with requests.get(url, stream=True, timeout=300) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("content-length", 0))
+            downloaded = 0
+            progress_bar = st.progress(0, text="Starting download…")
+
+            with open(dest, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1 MB chunks
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = min(downloaded / total, 1.0)
+                            mb_done  = downloaded / 1_048_576
+                            mb_total = total    / 1_048_576
+                            progress_bar.progress(
+                                pct,
+                                text=f"Downloading… {mb_done:.0f} MB / {mb_total:.0f} MB"
+                            )
+
+            progress_bar.progress(1.0, text="Download complete!")
+            st.success(f"CSV saved as `{dest.name}`. Loading dashboard…")
+            st.rerun()
+
+    except Exception as exc:
+        st.error(
+            f"Could not download the CSV automatically.\n\n"
+            f"**Error:** {exc}\n\n"
+            f"**Manual fix:** Download the file from the link below and save it as "
+            f"`{dest.name}` in the same folder as this script, then relaunch Streamlit.\n\n"
+            f"{url}"
+        )
+        st.stop()
+
+
+# Trigger download before anything else loads.
+download_csv_if_needed(CSV_URL, CSV_FILE)
+
+
+# =============================================================================
+# 4. HELPER FUNCTIONS
 # =============================================================================
 def find_existing_file(path: Path) -> Path:
-    """Return a valid CSV path or stop the dashboard with a helpful error."""
+    """Return the CSV path — by this point it should already exist from the download step."""
     if path.exists():
         return path
-
     script_folder_path = Path(__file__).resolve().parent / path.name
     if script_folder_path.exists():
         return script_folder_path
-
-    st.error("CSV file was not found.")
-    st.write("The dashboard looked for this file:")
-    st.code(str(path))
-    st.write("And also looked in the same folder as this dashboard script.")
-    st.write(
-        "Fix: move the CSV file into the same folder as this script, "
-        "or update `CSV_FILE` near the top of the script."
+    st.error(
+        f"CSV file `{path.name}` not found. "
+        "This should have been downloaded automatically on startup. "
+        "Try restarting the dashboard."
     )
     st.stop()
 
