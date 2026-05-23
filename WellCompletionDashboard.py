@@ -8,8 +8,8 @@ Purpose
 This Streamlit dashboard replaces the previous Excel workbook deliverable.
 It loads Well Completion Report data, filters for agriculture/animal-use wells,
 cleans dates and numeric columns, builds summary tables, creates interactive
-charts, an interactive map, and provides plain-English analysis for presentation
-preparation.
+charts, creates an interactive map, and provides plain-English analysis for the
+Group 10 project report.
 
 Beginner note
 -------------
@@ -21,58 +21,52 @@ Run it from the RStudio Terminal, Windows Command Prompt, or Anaconda Prompt wit
 
 If using RStudio with reticulate, install/require packages in the R Console with:
     library(reticulate)
-    py_require(c("pandas", "numpy", "streamlit", "plotly"))
+    py_require(c("pandas", "numpy", "streamlit", "plotly", "requests"))
 
 Then run the dashboard from the RStudio Terminal, not the R Console:
     streamlit run WellCompletionDashboard.py
 
-NEW in this version
--------------------
-- Section 10: Interactive Map — plots every well with valid coordinates on a
-  Plotly scatter-mapbox. Points are coloured by county and sized by well yield.
-  A sidebar control lets you pick which numeric field to use for point size.
-  The map uses the free OpenStreetMap tile layer so no API key is needed.
+Current version notes
+---------------------
+- The dashboard reads the CSV in chunks so it can safely handle either the
+  filtered AgricultureWellCompletionReport.csv file or the larger original Well
+  Completion Report CSV.
+- The dashboard keeps only the agriculture/animal-use records in memory.
+- The interactive map uses the free OpenStreetMap tile layer, so no map API key
+  is needed.
+- Live News & Policy Updates uses the Google Gemini API. Results are cached for
+  1 hour and only refresh when the user clicks a button.
+- The dashboard includes an executive summary, KPI percentage cards, a data
+  completeness scorecard, a county ranking table, a top-county deep dive, and a
+  methodology section to make the analysis more presentation-ready.
 
-- Section 15: Live News & Policy Updates — calls the Anthropic API (claude-sonnet-4-20250514)
-  with the built-in web_search tool to fetch current California news across three topics:
-    1. Well legislation and groundwater policy
-    2. Water infrastructure and conservation projects
-    3. Wildfire and drought risk
-  Results are cached for 30 minutes. A Refresh button lets users re-fetch without
-  restarting Streamlit. Requires the ANTHROPIC_API_KEY environment variable to be set
-  (see setup instructions below).
-
-Setup for Section 15
---------------------
-1. Get a free Anthropic API key at https://console.anthropic.com
+Setup for Live News & Policy Updates
+------------------------------------
+1. Get a Google Gemini API key from Google AI Studio.
 2. Set the environment variable before launching Streamlit.
 
    Windows Command Prompt:
-       set ANTHROPIC_API_KEY=sk-ant-...
+       set GEMINI_API_KEY=AIza...
        streamlit run WellCompletionDashboard.py
 
    Windows PowerShell:
-       $env:ANTHROPIC_API_KEY="sk-ant-..."
+       $env:GEMINI_API_KEY="AIza..."
        streamlit run WellCompletionDashboard.py
 
    Mac / Linux Terminal:
-       export ANTHROPIC_API_KEY=sk-ant-...
+       export GEMINI_API_KEY=AIza...
        streamlit run WellCompletionDashboard.py
 
    Alternatively, create a file called .env in the same folder as this script
    and add the line:
-       ANTHROPIC_API_KEY=sk-ant-...
-   then pip install python-dotenv and uncomment the dotenv lines near the top
-   of this script.
+       GEMINI_API_KEY=AIza...
+
+The manual .env loader below reads that file automatically when the dashboard starts.
 """
 
 from pathlib import Path
-import re
-import sys
 import os
-import json
 import time
-import datetime
 from typing import Iterable, Optional, Tuple
 
 import numpy as np
@@ -85,7 +79,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Manual .env loader — no third-party package required.
 # Create a file called .env in the same folder as this script and add:
-#     ANTHROPIC_API_KEY=sk-ant-...
+#     GEMINI_API_KEY=AIza...
 # The block below reads it automatically every time the dashboard starts.
 # ---------------------------------------------------------------------------
 def _load_dotenv_manual() -> None:
@@ -110,69 +104,21 @@ _load_dotenv_manual()
 # =============================================================================
 # 1. FILE PATH SETTINGS
 # =============================================================================
-# The CSV is downloaded automatically from the California open data portal
-# the first time the dashboard runs, then cached locally as wellcompletionreports.csv.
-# No manual download or file path changes needed.
+# IMPORTANT:
+# Change this path if your CSV file is somewhere else.
+#
+# Option A: If this dashboard file is in the same folder as the filtered CSV,
+# this default path should work:
+CSV_FILE = Path("AgricultureWellCompletionReport.csv")
 
-CSV_URL  = "https://data.cnra.ca.gov/dataset/647afc02-8954-426d-aabd-eff418d2652c/resource/8da7b93b-4e69-495d-9caa-335691a1896b/download/wellcompletionreports.csv"
-CSV_FILE = Path("wellcompletionreports.csv")   # cached local copy
-
-
-def download_csv_if_needed(url: str, dest: Path) -> None:
-    """
-    Download the CSV from the California open data portal if it is not
-    already cached locally. Shows a Streamlit progress bar during download.
-    The file is large (~500 MB) so this may take a few minutes on first run.
-    """
-    if dest.exists():
-        return   # Already downloaded — skip.
-
-    st.info(
-        f"Downloading the Well Completion Reports CSV from the California open data "
-        f"portal for the first time. This file is large and may take a few minutes. "
-        f"It will be cached locally as `{dest.name}` so subsequent launches are instant."
-    )
-
-    try:
-        with requests.get(url, stream=True, timeout=300) as response:
-            response.raise_for_status()
-            total = int(response.headers.get("content-length", 0))
-            downloaded = 0
-            progress_bar = st.progress(0, text="Downloading…")
-
-            with open(dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1 MB chunks
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            pct = min(downloaded / total, 1.0)
-                            mb_done = downloaded / 1_048_576
-                            mb_total = total / 1_048_576
-                            progress_bar.progress(
-                                pct,
-                                text=f"Downloading… {mb_done:.0f} MB / {mb_total:.0f} MB"
-                            )
-
-            progress_bar.progress(1.0, text="Download complete!")
-            st.success(f"CSV saved as `{dest.name}`. Reloading dashboard…")
-            st.rerun()
-
-    except Exception as exc:
-        st.error(
-            f"Could not download the CSV automatically.\n\n"
-            f"Error: {exc}\n\n"
-            f"**Manual fix:** Download the file from:\n{url}\n\n"
-            f"Save it as `{dest.name}` in the same folder as this script, "
-            f"then relaunch Streamlit."
-        )
-        st.stop()
-
-
-# Trigger download before anything else loads.
-download_csv_if_needed(CSV_URL, CSV_FILE)
+# Option B: If you want to use the original full CSV, replace the line above with
+# your full Windows path. Keep the r before the quotes:
+# CSV_FILE = Path(r"C:\Users\abjorn\OneDrive - Cal Poly\well_project\wellcompletionreports (1).csv")
 
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
+
+# Number of rows read at one time. Keeps memory use lower for large CSV files.
+CSV_READ_CHUNK_SIZE = 100_000
 
 # Columns from the project that need to be treated as dates.
 DATE_COLUMNS = ["DATEWORKENDED", "RECEIVEDDATE", "PERMITDATE"]
@@ -229,35 +175,145 @@ st.set_page_config(
 )
 
 
+# ---------------------------------------------------------------------------
+# Visual polish for the dashboard.
+# This CSS keeps the dashboard clean without adding extra dependencies.
+# ---------------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+        .main .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        .dashboard-subtitle {
+            font-size: 1.05rem;
+            color: #334155;
+            margin-bottom: 1.25rem;
+        }
+        .executive-summary {
+            background: linear-gradient(90deg, #e8f5f2 0%, #eef6ff 100%);
+            border-left: 6px solid #2a9d8f;
+            border-radius: 12px;
+            padding: 1.15rem 1.25rem;
+            margin: 0.5rem 0 1rem 0;
+            box-shadow: 0 1px 5px rgba(15, 23, 42, 0.08);
+        }
+        .executive-summary h3 {
+            margin-top: 0;
+            margin-bottom: 0.45rem;
+            color: #0f172a;
+        }
+        .executive-summary ul {
+            margin-bottom: 0;
+        }
+        .section-note {
+            background-color: #f8fafc;
+            border: 1px solid #d9e2ec;
+            border-radius: 10px;
+            padding: 0.85rem 1rem;
+            color: #334155;
+            margin-bottom: 1rem;
+        }
+        .small-muted {
+            color: #64748b;
+            font-size: 0.92rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 # =============================================================================
 # 3. HELPER FUNCTIONS
 # =============================================================================
 def find_existing_file(path: Path) -> Path:
-    """Return the CSV path — by this point it should already exist from the download step."""
+    """Return a valid CSV path or stop the dashboard with a helpful error."""
     if path.exists():
         return path
-    # Fallback: check same folder as the script.
+
     script_folder_path = Path(__file__).resolve().parent / path.name
     if script_folder_path.exists():
         return script_folder_path
-    st.error(
-        f"CSV file `{path.name}` not found. "
-        "This should have been downloaded automatically on startup. "
-        "Try restarting the dashboard."
+
+    st.error("CSV file was not found.")
+    st.write("The dashboard looked for this file:")
+    st.code(str(path))
+    st.write("And also looked in the same folder as this dashboard script.")
+    st.write(
+        "Fix: move the CSV file into the same folder as this script, "
+        "or update `CSV_FILE` near the top of the script."
     )
     st.stop()
 
 
-def read_csv_with_encoding_fallback(path: Path) -> Tuple[pd.DataFrame, str]:
-    """Read a CSV file by trying several common encodings."""
+def read_and_filter_csv_with_encoding_fallback(path: Path) -> Tuple[int, pd.DataFrame, str]:
+    """
+    Read the CSV in chunks, apply the agriculture/animal filter, and return only
+    the filtered dataframe.
+
+    Why this matters:
+    - The original Well Completion Report can be very large.
+    - Loading the entire original CSV into memory can make Streamlit slow or crash.
+    - This function counts all original rows but only keeps filtered rows in memory.
+    """
     last_error: Optional[Exception] = None
 
     for encoding in ENCODINGS_TO_TRY:
+        original_row_count = 0
+        filtered_chunks = []
+        empty_template: Optional[pd.DataFrame] = None
+        missing_use_column_warning_shown = False
+
         try:
-            df = pd.read_csv(path, encoding=encoding, low_memory=False)
-            return df, encoding
+            chunk_reader = pd.read_csv(
+                path,
+                encoding=encoding,
+                low_memory=False,
+                chunksize=CSV_READ_CHUNK_SIZE,
+            )
+
+            for chunk in chunk_reader:
+                original_row_count += len(chunk)
+
+                # Create an empty template once so we can return proper columns
+                # even if no rows match the agriculture/animal filter.
+                if empty_template is None:
+                    empty_template = add_clean_columns(chunk.iloc[0:0].copy())
+
+                cleaned_chunk = add_clean_columns(chunk)
+
+                if USE_COLUMN in cleaned_chunk.columns:
+                    filtered_chunk = filter_agriculture_animal(cleaned_chunk)
+                else:
+                    # If the use column is missing, keep all rows because there is
+                    # no safe way to apply the agriculture/animal filter.
+                    if not missing_use_column_warning_shown:
+                        st.warning(
+                            f"The column `{USE_COLUMN}` was not found, so the dashboard cannot apply "
+                            "the agriculture/animal filter. It will use all rows in the CSV."
+                        )
+                        missing_use_column_warning_shown = True
+                    filtered_chunk = cleaned_chunk
+
+                if not filtered_chunk.empty:
+                    filtered_chunks.append(filtered_chunk)
+
+            if filtered_chunks:
+                filtered_df = pd.concat(filtered_chunks, ignore_index=True)
+            elif empty_template is not None:
+                filtered_df = empty_template
+            else:
+                # Handles an empty CSV that still has headers.
+                header_only = pd.read_csv(path, encoding=encoding, nrows=0)
+                filtered_df = add_clean_columns(header_only)
+
+            return original_row_count, filtered_df, encoding
+
         except UnicodeDecodeError as error:
             last_error = error
+            continue
         except Exception as error:
             last_error = error
             break
@@ -452,18 +508,158 @@ def prepare_map_data(df: pd.DataFrame, size_col: Optional[str]) -> pd.DataFrame:
     return map_df
 
 
+
+
+def percent_value(numerator, denominator) -> float:
+    """Return a percentage as a number from 0 to 100."""
+    try:
+        denominator = float(denominator)
+        if denominator == 0:
+            return float("nan")
+        return 100 * float(numerator) / denominator
+    except Exception:
+        return float("nan")
+
+
+def format_percent(value, digits: int = 1) -> str:
+    """Format a percent value for display."""
+    if pd.isna(value):
+        return "N/A"
+    return f"{float(value):,.{digits}f}%"
+
+
+def format_decimal(value, digits: int = 2, suffix: str = "") -> str:
+    """Format a numeric value with a fixed number of decimal places."""
+    if pd.isna(value):
+        return "N/A"
+    return f"{float(value):,.{digits}f}{suffix}"
+
+
+def safe_median(df: pd.DataFrame, col: str) -> float:
+    """Return the median of a column, or NaN if the column is missing or empty."""
+    if col not in df.columns:
+        return float("nan")
+    valid = df[col].dropna()
+    if valid.empty:
+        return float("nan")
+    return float(valid.median())
+
+
+def valid_percent(df: pd.DataFrame, col: str) -> float:
+    """Return the percent of rows with a non-missing value in a column."""
+    if len(df) == 0 or col not in df.columns:
+        return float("nan")
+    return percent_value(df[col].notna().sum(), len(df))
+
+
+def valid_coordinate_count_and_pct(df: pd.DataFrame) -> Tuple[int, float]:
+    """Return count and percent of records with valid California coordinates."""
+    if len(df) == 0 or LAT_COL not in df.columns or LON_COL not in df.columns:
+        return 0, float("nan")
+    valid_mask = (
+        df[LAT_COL].notna()
+        & df[LON_COL].notna()
+        & df[LAT_COL].between(CA_LAT_MIN, CA_LAT_MAX)
+        & df[LON_COL].between(CA_LON_MIN, CA_LON_MAX)
+    )
+    count = int(valid_mask.sum())
+    return count, percent_value(count, len(df))
+
+
+def build_data_quality_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Create a field-level completeness table for key date and numeric columns."""
+    rows = []
+    total_rows = len(df)
+
+    for date_col in DATE_COLUMNS:
+        parsed_col = f"{date_col}_PARSED"
+        if parsed_col in df.columns:
+            valid_count = int(df[parsed_col].notna().sum())
+            rows.append(
+                {
+                    "Field": date_col,
+                    "Type": "Date",
+                    "Valid Count": valid_count,
+                    "Missing/Invalid": int(total_rows - valid_count),
+                    "Percent Valid": round(percent_value(valid_count, total_rows), 1),
+                }
+            )
+
+    for numeric_col in NUMERIC_COLUMNS:
+        clean_col = f"{numeric_col}_NUM"
+        if clean_col in df.columns:
+            valid_count = int(df[clean_col].notna().sum())
+            rows.append(
+                {
+                    "Field": numeric_col,
+                    "Type": "Numeric",
+                    "Valid Count": valid_count,
+                    "Missing/Invalid": int(total_rows - valid_count),
+                    "Percent Valid": round(percent_value(valid_count, total_rows), 1),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def build_county_ranking_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Rank counties by record count and key median well characteristics."""
+    if df.empty or "COUNTYNAME_CLEAN" not in df.columns:
+        return pd.DataFrame()
+
+    rows = []
+    for county, county_df in df.groupby("COUNTYNAME_CLEAN", dropna=False):
+        coord_count, coord_pct = valid_coordinate_count_and_pct(county_df)
+        rows.append(
+            {
+                "County": county,
+                "Record Count": int(len(county_df)),
+                "% of Current Filter": round(percent_value(len(county_df), len(df)), 1),
+                "Median Drill Depth": round(safe_median(county_df, "TOTALDRILLDEPTH_NUM"), 2),
+                "Median Completed Depth": round(safe_median(county_df, "TOTALCOMPLETEDDEPTH_NUM"), 2),
+                "Median Well Yield": round(safe_median(county_df, "WELLYIELD_NUM"), 2),
+                "Median Static Water Level": round(safe_median(county_df, "STATICWATERLEVEL_NUM"), 2),
+                "Valid Coordinate %": round(coord_pct, 1),
+                "Valid Coordinate Count": coord_count,
+            }
+        )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["Record Count", "County"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+
+def top_use_table_for_county(df: pd.DataFrame, county: str, n: int = 10) -> pd.DataFrame:
+    """Return the top planned/former-use categories for a selected county."""
+    if df.empty or "COUNTYNAME_CLEAN" not in df.columns:
+        return pd.DataFrame()
+    county_df = df[df["COUNTYNAME_CLEAN"] == county]
+    if county_df.empty or "PLANNEDUSEFORMERUSE_CLEAN" not in county_df.columns:
+        return pd.DataFrame()
+    return (
+        county_df.groupby("PLANNEDUSEFORMERUSE_CLEAN", dropna=False)
+        .size()
+        .reset_index(name="Record Count")
+        .sort_values("Record Count", ascending=False)
+        .head(n)
+    )
+
+
+def add_why_this_matters(text: str) -> None:
+    """Render a consistent explanatory note below a section heading."""
+    st.markdown(f'<div class="section-note"><strong>Why this matters:</strong> {text}</div>', unsafe_allow_html=True)
+
 # =============================================================================
 # 4. LOAD AND PREPARE DATA
 # =============================================================================
 @st.cache_data(show_spinner=True)
-def load_and_prepare_data(csv_path_string: str) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Load the CSV and return original data, filtered data, and encoding used."""
+def load_and_prepare_data(csv_path_string: str) -> Tuple[int, pd.DataFrame, str]:
+    """Load the CSV and return the original row count, filtered data, and encoding used."""
     csv_path = find_existing_file(Path(csv_path_string))
-    original_df, encoding_used = read_csv_with_encoding_fallback(csv_path)
-    original_df = add_clean_columns(original_df)
-    filtered_df = filter_agriculture_animal(original_df)
-    filtered_df = add_clean_columns(filtered_df)
-    return original_df, filtered_df, encoding_used
+    original_row_count, filtered_df, encoding_used = read_and_filter_csv_with_encoding_fallback(csv_path)
+    return original_row_count, filtered_df, encoding_used
 
 
 # =============================================================================
@@ -487,7 +683,7 @@ with st.sidebar:
     st.write("Current CSV path:")
     st.code(str(CSV_FILE))
 
-original_data, data, encoding = load_and_prepare_data(str(CSV_FILE))
+original_row_count, data, encoding = load_and_prepare_data(str(CSV_FILE))
 
 
 # =============================================================================
@@ -557,10 +753,13 @@ with st.sidebar:
     map_color_by_county = st.checkbox("Colour points by county", value=True)
 
 
+
 # =============================================================================
-# 7. SUMMARY METRIC CARDS
+# 7. CORE SUMMARY CALCULATIONS
 # =============================================================================
-st.header("Summary Metrics")
+# These tables and values are used by several dashboard sections. Keeping them
+# together avoids recalculating the same values multiple times.
+st.header("Dashboard Overview")
 
 records_by_county = (
     filtered_data.groupby("COUNTYNAME_CLEAN", dropna=False)
@@ -570,6 +769,7 @@ records_by_county = (
 )
 
 top_county, top_county_count = safe_top_value(records_by_county, "COUNTYNAME_CLEAN", "Record Count")
+top_county_pct = percent_value(top_county_count, len(filtered_data))
 
 if "RECEIVEDYEAR" in filtered_data.columns:
     records_by_year = (
@@ -588,23 +788,14 @@ else:
     top_year, top_year_count = "No data", 0
     missing_received_date = 0
 
-metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
-metric_1.metric("Original CSV Rows", format_number(len(original_data)))
-metric_2.metric("Filtered Dashboard Rows", format_number(len(filtered_data)))
-metric_3.metric("Unique Counties", format_number(filtered_data["COUNTYNAME_CLEAN"].nunique()))
-metric_4.metric("Top County", top_county, format_number(top_county_count))
-metric_5.metric("Top Received Year", str(top_year), format_number(top_year_count))
-
-st.caption(
-    f"CSV encoding used: `{encoding}`. "
-    f"Missing/invalid received dates in current filter: {missing_received_date:,}."
+records_by_use = (
+    filtered_data.groupby("PLANNEDUSEFORMERUSE_CLEAN", dropna=False)
+    .size()
+    .reset_index(name="Record Count")
+    .sort_values("Record Count", ascending=False)
 )
 
-
-# =============================================================================
-# 8. KEY FINDINGS
-# =============================================================================
-st.header("Key Findings")
+top_use, top_use_count = safe_top_value(records_by_use, "PLANNEDUSEFORMERUSE_CLEAN", "Record Count")
 
 numeric_cols_for_summary = [
     "TOTALDRILLDEPTH_NUM",
@@ -613,50 +804,103 @@ numeric_cols_for_summary = [
     "WELLYIELD_NUM",
 ]
 num_summary = numeric_summary_table(filtered_data, numeric_cols_for_summary)
+quality_table = build_data_quality_table(filtered_data)
+county_ranking = build_county_ranking_table(filtered_data)
 
-well_yield_median = np.nan
-if "WELLYIELD_NUM" in filtered_data.columns:
-    well_yield_median = filtered_data["WELLYIELD_NUM"].median()
+completed_depth_median = safe_median(filtered_data, "TOTALCOMPLETEDDEPTH_NUM")
+well_yield_median = safe_median(filtered_data, "WELLYIELD_NUM")
+static_water_median = safe_median(filtered_data, "STATICWATERLEVEL_NUM")
+drill_depth_median = safe_median(filtered_data, "TOTALDRILLDEPTH_NUM")
+valid_coord_count, valid_coord_pct = valid_coordinate_count_and_pct(filtered_data)
+valid_completed_pct = valid_percent(filtered_data, "TOTALCOMPLETEDDEPTH_NUM")
+valid_yield_pct = valid_percent(filtered_data, "WELLYIELD_NUM")
+current_filter_pct_of_original = percent_value(len(filtered_data), original_row_count)
 
-completed_depth_median = np.nan
-if "TOTALCOMPLETEDDEPTH_NUM" in filtered_data.columns:
-    completed_depth_median = filtered_data["TOTALCOMPLETEDDEPTH_NUM"].median()
+# =============================================================================
+# 8. EXECUTIVE SUMMARY AND KPI CARDS
+# =============================================================================
+st.subheader("Executive Summary")
+
+st.markdown(
+    f"""
+    <div class="executive-summary">
+        <h3>Current Filter Summary</h3>
+        <ul>
+            <li>The dashboard is currently analyzing <strong>{len(filtered_data):,}</strong> agriculture/animal-use well records.</li>
+            <li><strong>{top_county}</strong> is the leading county with <strong>{top_county_count:,}</strong> records, representing <strong>{format_percent(top_county_pct)}</strong> of the current filtered view.</li>
+            <li>The top received year is <strong>{top_year}</strong> with <strong>{top_year_count:,}</strong> records.</li>
+            <li>The median completed depth is <strong>{format_decimal(completed_depth_median, 2, ' ft')}</strong>, and the median well yield is <strong>{format_decimal(well_yield_median, 2, ' gpm')}</strong>.</li>
+            <li><strong>{format_percent(valid_coord_pct)}</strong> of the current filtered records have valid California coordinates for mapping.</li>
+        </ul>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+add_why_this_matters(
+    "This summary gives a quick, presentation-ready interpretation of the current dashboard filters before users inspect the detailed charts."
+)
+
+kpi_row_1 = st.columns(5)
+kpi_row_1[0].metric("Original CSV Rows", format_number(original_row_count))
+kpi_row_1[1].metric("Current Filter Rows", format_number(len(filtered_data)))
+kpi_row_1[2].metric("Current Share of Original", format_percent(current_filter_pct_of_original))
+kpi_row_1[3].metric("Unique Counties", format_number(filtered_data["COUNTYNAME_CLEAN"].nunique()))
+kpi_row_1[4].metric("Top County", top_county, format_number(top_county_count))
+
+kpi_row_2 = st.columns(5)
+kpi_row_2[0].metric("Valid Completed Depth", format_percent(valid_completed_pct))
+kpi_row_2[1].metric("Valid Well Yield", format_percent(valid_yield_pct))
+kpi_row_2[2].metric("Valid Map Coordinates", format_percent(valid_coord_pct), format_number(valid_coord_count))
+kpi_row_2[3].metric("Median Static Water", format_decimal(static_water_median, 2, " ft"))
+kpi_row_2[4].metric("Top Received Year", str(top_year), format_number(top_year_count))
+
+st.caption(
+    f"CSV encoding used: `{encoding}`. "
+    f"Missing/invalid received dates in current filter: {missing_received_date:,}."
+)
+
+# =============================================================================
+# 9. KEY FINDINGS
+# =============================================================================
+st.header("Key Findings")
 
 st.markdown(
     f"""
 - The current filter contains **{len(filtered_data):,}** agriculture/animal-use well records.
-- The county with the most records is **{top_county}** with **{top_county_count:,}** records.
+- The county with the most records is **{top_county}**, accounting for **{format_percent(top_county_pct)}** of the current filtered records.
 - The received year with the most records is **{top_year}** with **{top_year_count:,}** records.
-- The median total completed depth is **{completed_depth_median:,.2f}** when valid depth data is available.
-- The median well yield is **{well_yield_median:,.2f}** when valid yield data is available.
+- The median total drill depth is **{format_decimal(drill_depth_median, 2, ' ft')}**, while the median completed depth is **{format_decimal(completed_depth_median, 2, ' ft')}**.
+- The median well yield is **{format_decimal(well_yield_median, 2, ' gpm')}** when valid yield data is available.
+- Mapping analysis is based on **{valid_coord_count:,}** records with valid California latitude and longitude values.
 """
 )
 
-st.info(
-    "Presentation note: use this section to start your future PowerPoint. "
-    "It identifies the main county, year, depth, and yield findings from the dashboard."
+# =============================================================================
+# 10. SUMMARY TABLES AND SCORECARDS
+# =============================================================================
+st.header("Summary Tables and Scorecards")
+
+summary_tabs = st.tabs(
+    [
+        "Records by County",
+        "Records by Received Year",
+        "Records by Use",
+        "Numeric Summary",
+        "County Ranking",
+        "Data Completeness",
+    ]
 )
 
-
-# =============================================================================
-# 9. SUMMARY TABLES
-# =============================================================================
-st.header("Summary Tables")
-
-table_tab_1, table_tab_2, table_tab_3, table_tab_4 = st.tabs(
-    ["Records by County", "Records by Received Year", "Records by Use", "Numeric Summary"]
-)
-
-with table_tab_1:
+with summary_tabs[0]:
     st.subheader("Records by County")
     st.dataframe(records_by_county, use_container_width=True, hide_index=True)
     st.markdown(
         "This table shows where agriculture/animal-use well records are concentrated. "
-        "Higher counts suggest counties with more reporting activity or more "
-        "agriculture/animal-use wells in this dataset."
+        "Higher counts suggest counties with more reporting activity or more agriculture/animal-use wells in this dataset."
     )
 
-with table_tab_2:
+with summary_tabs[1]:
     st.subheader("Records by Received Year")
     if records_by_year.empty:
         st.warning("No valid received-year data is available.")
@@ -667,33 +911,158 @@ with table_tab_2:
             "It helps identify reporting spikes or periods with fewer records."
         )
 
-with table_tab_3:
+with summary_tabs[2]:
     st.subheader("Records by Planned/Former Use")
-    records_by_use = (
-        filtered_data.groupby("PLANNEDUSEFORMERUSE_CLEAN", dropna=False)
-        .size()
-        .reset_index(name="Record Count")
-        .sort_values("Record Count", ascending=False)
-    )
     st.dataframe(records_by_use, use_container_width=True, hide_index=True)
     st.markdown(
         "This table shows the specific planned or former use categories that matched "
-        "the agriculture/animal filter. It is useful for checking whether the filtered "
-        "data matches the project definition."
+        "the agriculture/animal filter. It is useful for checking whether the filtered data matches the project definition."
     )
 
-with table_tab_4:
+with summary_tabs[3]:
     st.subheader("Numeric Summary")
     st.dataframe(num_summary, use_container_width=True, hide_index=True)
     st.markdown(
         "This table checks whether important numeric fields are usable for analysis. "
-        "The missing/invalid count is important because large missing values can affect "
-        "conclusions from charts and averages."
+        "The missing/invalid count is important because large missing values can affect conclusions from charts and averages."
     )
 
+with summary_tabs[4]:
+    st.subheader("County Ranking Table")
+    if county_ranking.empty:
+        st.warning("No county ranking data is available for the current filter.")
+    else:
+        st.dataframe(county_ranking, use_container_width=True, hide_index=True)
+        st.markdown(
+            "This table ranks counties using both record volume and well characteristics. "
+            "It is useful for identifying counties that may deserve a closer look in the presentation."
+        )
+
+with summary_tabs[5]:
+    st.subheader("Data Completeness Scorecard")
+    if quality_table.empty:
+        st.warning("No quality fields are available for the current filter.")
+    else:
+        chart_quality = quality_table.sort_values("Percent Valid", ascending=True)
+        fig_quality = px.bar(
+            chart_quality,
+            x="Percent Valid",
+            y="Field",
+            color="Type",
+            orientation="h",
+            title="Percent of Valid Values by Field",
+            range_x=[0, 100],
+            labels={"Percent Valid": "Valid Values (%)", "Field": "Field"},
+            color_discrete_map={"Date": "#2a9d8f", "Numeric": "#457b9d"},
+        )
+        fig_quality.update_layout(height=620, margin={"l": 10, "r": 10, "t": 55, "b": 10})
+        st.plotly_chart(fig_quality, use_container_width=True)
+        st.dataframe(quality_table, use_container_width=True, hide_index=True)
+        st.markdown(
+            "This scorecard makes data quality visible. Fields with low valid percentages should be interpreted carefully because charts using those fields are based on fewer records."
+        )
 
 # =============================================================================
-# 10. INTERACTIVE MAP  (new section)
+# 11. TOP COUNTY DEEP DIVE
+# =============================================================================
+st.header("Top County Deep Dive")
+
+add_why_this_matters(
+    "A focused county view helps explain regional differences instead of only showing statewide totals."
+)
+
+if county_ranking.empty:
+    st.warning("No counties are available for a deep dive with the current filters.")
+else:
+    deep_dive_counties = county_ranking["County"].tolist()
+    default_index = deep_dive_counties.index(top_county) if top_county in deep_dive_counties else 0
+    selected_deep_county = st.selectbox(
+        "Choose a county for deeper analysis",
+        options=deep_dive_counties,
+        index=default_index,
+        key="deep_dive_county",
+    )
+
+    county_df = filtered_data[filtered_data["COUNTYNAME_CLEAN"] == selected_deep_county].copy()
+    county_coord_count, county_coord_pct = valid_coordinate_count_and_pct(county_df)
+
+    county_metric_cols = st.columns(5)
+    county_metric_cols[0].metric("County Records", format_number(len(county_df)))
+    county_metric_cols[1].metric("Median Drill Depth", format_decimal(safe_median(county_df, "TOTALDRILLDEPTH_NUM"), 2, " ft"))
+    county_metric_cols[2].metric("Median Completed Depth", format_decimal(safe_median(county_df, "TOTALCOMPLETEDDEPTH_NUM"), 2, " ft"))
+    county_metric_cols[3].metric("Median Well Yield", format_decimal(safe_median(county_df, "WELLYIELD_NUM"), 2, " gpm"))
+    county_metric_cols[4].metric("Valid Coordinates", format_percent(county_coord_pct), format_number(county_coord_count))
+
+    left_col, right_col = st.columns([1.1, 1])
+
+    with left_col:
+        st.subheader(f"Records by Year: {selected_deep_county}")
+        if "RECEIVEDYEAR" in county_df.columns and county_df["RECEIVEDYEAR"].notna().any():
+            county_years = (
+                county_df.dropna(subset=["RECEIVEDYEAR"])
+                .assign(RECEIVEDYEAR=lambda d: d["RECEIVEDYEAR"].astype(int))
+                .groupby("RECEIVEDYEAR")
+                .size()
+                .reset_index(name="Record Count")
+                .sort_values("RECEIVEDYEAR")
+            )
+            fig_county_year = px.line(
+                county_years,
+                x="RECEIVEDYEAR",
+                y="Record Count",
+                markers=True,
+                title=f"{selected_deep_county} Records by Received Year",
+                labels={"RECEIVEDYEAR": "Received Year", "Record Count": "Number of Records"},
+            )
+            fig_county_year.update_layout(height=390)
+            st.plotly_chart(fig_county_year, use_container_width=True)
+        else:
+            st.warning("No valid received-year values are available for this county.")
+
+    with right_col:
+        st.subheader(f"Top Uses: {selected_deep_county}")
+        county_uses = top_use_table_for_county(filtered_data, selected_deep_county)
+        if county_uses.empty:
+            st.warning("No planned/former-use values are available for this county.")
+        else:
+            fig_county_use = px.bar(
+                county_uses.sort_values("Record Count"),
+                x="Record Count",
+                y="PLANNEDUSEFORMERUSE_CLEAN",
+                orientation="h",
+                title=f"Top Use Categories in {selected_deep_county}",
+                labels={"PLANNEDUSEFORMERUSE_CLEAN": "Planned/Former Use"},
+            )
+            fig_county_use.update_layout(height=390)
+            st.plotly_chart(fig_county_use, use_container_width=True)
+
+    st.markdown(
+        f"For **{selected_deep_county}**, the dashboard compares record volume, depth, yield, water level, and yearly activity. "
+        "This section is useful for selecting one county to discuss in more detail during the final project presentation."
+    )
+
+# =============================================================================
+# 12. METHODOLOGY
+# =============================================================================
+with st.expander("Methodology: how the dashboard prepares and analyzes the data"):
+    st.markdown(
+        """
+**Filtering rule.** Records are included when `PLANNEDUSEFORMERUSE` contains the word `agriculture` or `animal`, ignoring capitalization.
+
+**Large-file handling.** The CSV is read in chunks, and only the agriculture/animal-use records are kept in memory. This makes the dashboard safer to use with either the original Well Completion Report CSV or the filtered CSV.
+
+**Date preparation.** `DATEWORKENDED`, `RECEIVEDDATE`, and `PERMITDATE` are converted to dates. Invalid or blank dates become missing values instead of causing the dashboard to crash.
+
+**Numeric preparation.** Depth, yield, elevation, casing, drawdown, pump test length, latitude, and longitude fields are cleaned by removing commas and non-numeric characters before conversion.
+
+**Map preparation.** Only latitude and longitude values inside a California bounding box are used for the map. If too many points are available, the dashboard samples up to the configured map limit so the browser remains responsive.
+
+**Outlier handling.** Some charts cap extreme values only for display. Summary tables still use the original cleaned numeric values.
+        """
+    )
+
+# =============================================================================
+# 13. INTERACTIVE MAP
 # =============================================================================
 st.header("Interactive Well Location Map")
 
@@ -782,7 +1151,7 @@ else:
 
 
 # =============================================================================
-# 11. DASHBOARD CHARTS
+# 14. INTERACTIVE DASHBOARD CHARTS
 # =============================================================================
 st.header("Interactive Charts")
 
@@ -983,7 +1352,7 @@ with chart_tab_5:
 
 
 # =============================================================================
-# 12. COUNTY COMPARISON TOOL  (new section)
+# 15. COUNTY COMPARISON TOOL
 # =============================================================================
 st.header("County Comparison Tool")
 
@@ -1139,46 +1508,21 @@ else:
 
 
 # =============================================================================
-# 13. DATA QUALITY CHECKS
+# 16. DETAILED DATA QUALITY CHECKS
 # =============================================================================
-st.header("Data Quality Checks")
+st.header("Detailed Data Quality Checks")
 
-quality_rows = []
-for date_col in DATE_COLUMNS:
-    parsed_col = f"{date_col}_PARSED"
-    if parsed_col in filtered_data.columns:
-        quality_rows.append(
-            {
-                "Field": date_col,
-                "Type": "Date",
-                "Valid Count": int(filtered_data[parsed_col].notna().sum()),
-                "Missing/Invalid": int(filtered_data[parsed_col].isna().sum()),
-            }
-        )
-
-for numeric_col in NUMERIC_COLUMNS:
-    clean_col = f"{numeric_col}_NUM"
-    if clean_col in filtered_data.columns:
-        quality_rows.append(
-            {
-                "Field": numeric_col,
-                "Type": "Numeric",
-                "Valid Count": int(filtered_data[clean_col].notna().sum()),
-                "Missing/Invalid": int(filtered_data[clean_col].isna().sum()),
-            }
-        )
-
-quality_table = pd.DataFrame(quality_rows)
-st.dataframe(quality_table, use_container_width=True, hide_index=True)
-st.markdown(
-    "This table documents which date and numeric fields are usable. "
-    "It is important for explaining why some charts may have fewer records than "
-    "the full filtered dataset."
-)
-
+if quality_table.empty:
+    st.warning("No data quality fields are available for the current filter.")
+else:
+    st.dataframe(quality_table, use_container_width=True, hide_index=True)
+    st.markdown(
+        "This table documents which date and numeric fields are usable. "
+        "It is important for explaining why some charts may have fewer records than the full filtered dataset."
+    )
 
 # =============================================================================
-# 13. RAW DATA PREVIEW
+# 17. RAW DATA PREVIEW
 # =============================================================================
 if show_raw_data:
     st.header("Filtered Raw Data Preview")
@@ -1187,7 +1531,7 @@ if show_raw_data:
 
 
 # =============================================================================
-# 14. DOWNLOAD OPTIONS
+# 18. DOWNLOAD OPTIONS
 # =============================================================================
 st.header("Download Prepared Data")
 
@@ -1200,7 +1544,7 @@ st.download_button(
 )
 
 # =============================================================================
-# 15. LIVE NEWS & POLICY UPDATES
+# 19. LIVE NEWS & POLICY UPDATES
 # =============================================================================
 st.header("Live News & Policy Updates")
 
@@ -1298,14 +1642,6 @@ else:
         "water.ca.gov · fire.ca.gov · droughtmonitor.unl.edu"
     )
 
-
-# =============================================================================
-# 16. RAW DATA PREVIEW
-# =============================================================================
-if show_raw_data:
-    st.header("Filtered Raw Data Preview")
-    st.dataframe(filtered_data.head(1000), use_container_width=True)
-    st.caption("Showing the first 1,000 filtered rows only so the dashboard stays responsive.")
 
 
 st.caption("End of dashboard.")
